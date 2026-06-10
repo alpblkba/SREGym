@@ -10,6 +10,7 @@ from sregym.conductor.problems.admission_webhook_tls_mismatch import AdmissionWe
 from sregym.conductor.problems.mutating_webhook_resource_limits import MutatingWebhookResourceLimits
 from sregym.conductor.problems.assign_non_existent_node import AssignNonExistentNode
 from sregym.conductor.problems.auth_miss_mongodb import MongoDBAuthMissing
+from sregym.conductor.problems.booking_consistency_hotel_reservation import BookingConsistencyHotelReservation
 from sregym.conductor.problems.capacity_decrease_rpc_retry_storm import CapacityDecreaseRPCRetryStorm
 from sregym.conductor.problems.cart_service_failure import CartServiceFailure
 from sregym.conductor.problems.configmap_drift import ConfigMapDrift
@@ -150,6 +151,7 @@ class ProblemRegistry:
             "missing_service_social_network": lambda: MissingService(app_name="social_network", faulty_service="user-service"),
             "namespace_memory_limit": NamespaceMemoryLimit,
             "pod_anti_affinity_deadlock": PodAntiAffinityDeadlock,
+            "booking_consistency_hotel_reservation": lambda: BookingConsistencyHotelReservation(),
             "persistent_volume_affinity_violation": PersistentVolumeAffinityViolation,
             "priority_preemption_cascade_hotel_reservation": PriorityPreemptionCascadeHotelReservation,
             "pvc_claim_mismatch": PVCClaimMismatch,
