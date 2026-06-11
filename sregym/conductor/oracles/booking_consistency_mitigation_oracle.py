@@ -1,4 +1,4 @@
-"""Mitigation oracle for booking_consistency_hotel_reservation.
+"""Mitigation oracle for booking_consistency_colocation_hotel_reservation.
 
 v0.0.1 goals:
 
