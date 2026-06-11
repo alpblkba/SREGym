@@ -30,7 +30,7 @@ from sregym.service.kubectl import KubeCtl
 from sregym.utils.decorators import mark_fault_injected
 
 
-class BookingConsistencyHotelReservation(Problem):
+class BookingConsistencyColocationHotelReservation(Problem):
     """Inject a required background consistency workload into the frontend pod."""
 
     frontend_deployment = "frontend"
