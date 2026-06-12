@@ -59,9 +59,22 @@ class BookingConsistencyColocationHotelReservation(Problem):
     file_mib_env = "BOOKING_LEDGER_FILE_MIB"
     reports_env = "BOOKING_CONSISTENCY_REPORT_DIR"
 
-    default_interval_seconds = "1"
-    default_file_count = "96"
-    default_file_mib = "2"
+    default_interval_seconds = "0"
+    default_file_count = "512"
+    default_file_mib = "8"
+    default_worker_count = "8"
+    default_compact_mib = "128"
+    default_temp_files = "1"
+    default_diagnostic_base_workers = "192"
+    default_diagnostic_max_workers = "192"
+    default_diagnostic_ramp_scale = "0"
+    default_diagnostic_mongo_timeout_ms = "1000"
+    default_diagnostic_report_window_seconds = "10"
+    default_diagnostic_base_batch = "4"
+    default_diagnostic_max_batch = "12"
+    default_diagnostic_batch_ramp_seconds = "20"
+    default_diagnostic_seed = "13"
+    default_diagnostic_mongo_targets = "mongodb-reservation:27017,mongodb-recommendation:27017,mongodb-rate:27017,mongodb-profile:27017"
 
     required_sidecars = [
         ledger_reader_name,
@@ -143,9 +156,8 @@ class BookingConsistencyColocationHotelReservation(Problem):
         self._log_step(f"rollout output: {rollout_output.strip()}")
 
         self._log_step("waiting for frontend pod and all booking-consistency containers to become Ready")
-        self._wait_for_frontend_pod_ready(timeout=180)
+        pod_name = self._wait_for_frontend_pod_ready(timeout=240)
 
-        pod_name = self._frontend_pod_name()
         self._log_step(f"current frontend pod: {pod_name}")
 
         self._log_step("waiting for report artifacts from report-writer")
@@ -212,7 +224,7 @@ class BookingConsistencyColocationHotelReservation(Problem):
         volumes = existing_volumes + [
             client.V1Volume(
                 name=self.ledger_volume_name,
-                empty_dir=client.V1EmptyDirVolumeSource(),
+                empty_dir=client.V1EmptyDirVolumeSource(size_limit="8Gi"),
             ),
             client.V1Volume(
                 name=self.reports_volume_name,
@@ -240,61 +252,222 @@ class BookingConsistencyColocationHotelReservation(Problem):
 
     def _ledger_reader_container(self):
         script = r"""
-set -eu
+import hashlib
+import json
+import multiprocessing as mp
+import os
+import random
+import time
+from pathlib import Path
 
-echo "[ledger-reader] starting"
-echo "[ledger-reader] input path: $BOOKING_LEDGER_INPUT_PATH"
-echo "[ledger-reader] archive path: $BOOKING_LEDGER_ARCHIVE_PATH"
-echo "[ledger-reader] report dir: $BOOKING_CONSISTENCY_REPORT_DIR"
-echo "[ledger-reader] interval seconds: $BOOKING_LEDGER_INTERVAL_SECONDS"
-echo "[ledger-reader] file count: $BOOKING_LEDGER_FILE_COUNT"
-echo "[ledger-reader] file mib: $BOOKING_LEDGER_FILE_MIB"
+input_path = Path(os.environ["BOOKING_LEDGER_INPUT_PATH"])
+archive_path = Path(os.environ["BOOKING_LEDGER_ARCHIVE_PATH"])
+report_dir = Path(os.environ["BOOKING_CONSISTENCY_REPORT_DIR"])
 
-mkdir -p "$BOOKING_LEDGER_INPUT_PATH" "$BOOKING_LEDGER_ARCHIVE_PATH" "$BOOKING_CONSISTENCY_REPORT_DIR"
+interval_seconds = float(os.environ.get("BOOKING_LEDGER_INTERVAL_SECONDS", "0"))
+file_count = int(os.environ.get("BOOKING_LEDGER_FILE_COUNT", "512"))
+file_mib = int(os.environ.get("BOOKING_LEDGER_FILE_MIB", "8"))
+worker_count = int(os.environ.get("BOOKING_LEDGER_WORKER_COUNT", "6"))
+compact_mib = int(os.environ.get("BOOKING_LEDGER_COMPACT_MIB", "512"))
+temp_files = int(os.environ.get("BOOKING_LEDGER_TEMP_FILES", "8"))
 
-if [ ! -f "$BOOKING_LEDGER_INPUT_PATH/.initialized" ]; then
-  echo "[ledger-reader] initializing ledger artifact set"
-  i=1
-  while [ "$i" -le "$BOOKING_LEDGER_FILE_COUNT" ]; do
-    dd if=/dev/zero of="$BOOKING_LEDGER_INPUT_PATH/ledger-$i.dat" bs=1M count="$BOOKING_LEDGER_FILE_MIB" 2>/dev/null
-    dd if=/dev/zero of="$BOOKING_LEDGER_ARCHIVE_PATH/ledger-$i.dat" bs=1M count="$BOOKING_LEDGER_FILE_MIB" 2>/dev/null
-    if [ $((i % 16)) -eq 0 ]; then
-      echo "[ledger-reader] initialized $i ledger artifacts"
-    fi
-    i=$((i + 1))
-  done
-  date +%s > "$BOOKING_LEDGER_INPUT_PATH/.initialized"
-  echo "[ledger-reader] initialization completed"
-else
-  echo "[ledger-reader] ledger artifact set already initialized"
-fi
+chunk_size = 1024 * 1024
+file_bytes = file_mib * chunk_size
+compact_bytes = compact_mib * chunk_size
 
-while true; do
-  start=$(date +%s)
-  files=0
+input_path.mkdir(parents=True, exist_ok=True)
+archive_path.mkdir(parents=True, exist_ok=True)
+report_dir.mkdir(parents=True, exist_ok=True)
+compact_path = input_path / ".compact"
+compact_path.mkdir(parents=True, exist_ok=True)
 
-  for file in "$BOOKING_LEDGER_INPUT_PATH"/ledger-*.dat; do
-    if [ -f "$file" ]; then
-      files=$((files + 1))
-      cat "$file" >/dev/null
-    fi
-  done
+print("[ledger-reader] starting nuclear bounded ledger compactor", flush=True)
+print(f"[ledger-reader] input path: {input_path}", flush=True)
+print(f"[ledger-reader] archive path: {archive_path}", flush=True)
+print(f"[ledger-reader] report dir: {report_dir}", flush=True)
+print(f"[ledger-reader] interval seconds: {interval_seconds}", flush=True)
+print(f"[ledger-reader] file count: {file_count}", flush=True)
+print(f"[ledger-reader] file mib: {file_mib}", flush=True)
+print(f"[ledger-reader] worker count: {worker_count}", flush=True)
+print(f"[ledger-reader] compact mib: {compact_mib}", flush=True)
+print(f"[ledger-reader] temp files: {temp_files}", flush=True)
 
-  end=$(date +%s)
-  duration=$((end - start))
-  printf '%s\n' "$end" > "$BOOKING_CONSISTENCY_REPORT_DIR/ledger_reader_last_run"
-  printf '{"timestamp":%s,"input_path":"%s","files":%s,"duration_seconds":%s}\n' \
-    "$end" "$BOOKING_LEDGER_INPUT_PATH" "$files" "$duration" \
-    > "$BOOKING_CONSISTENCY_REPORT_DIR/ledger_reader_status.json"
-  echo "[ledger-reader] scan done: ts=$end path=$BOOKING_LEDGER_INPUT_PATH files=$files duration=${duration}s"
-  sleep "$BOOKING_LEDGER_INTERVAL_SECONDS"
-done
+def write_file(path: Path, size_bytes: int, seed: bytes):
+    block = hashlib.blake2b(seed, digest_size=32).digest()
+    remaining = size_bytes
+    with path.open("wb") as f:
+        while remaining > 0:
+            payload = (block * ((min(chunk_size, remaining) // len(block)) + 1))[:min(chunk_size, remaining)]
+            f.write(payload)
+            remaining -= len(payload)
+
+def initialize_ledgers():
+    marker = input_path / ".initialized"
+    if marker.exists():
+        print("[ledger-reader] ledger artifact set already initialized", flush=True)
+        return
+
+    print("[ledger-reader] initializing active ledger artifact set", flush=True)
+    for i in range(1, file_count + 1):
+        path = input_path / f"ledger-{i}.dat"
+        if not path.exists() or path.stat().st_size != file_bytes:
+            write_file(path, file_bytes, f"current-{i}".encode())
+
+        # archive exists as a legitimate mitigation target, but keep it smaller
+        # so moving the reader there materially reduces the hot working set.
+        if i <= max(16, file_count // 16):
+            archive = archive_path / f"ledger-{i}.dat"
+            if not archive.exists() or archive.stat().st_size != file_bytes:
+                write_file(archive, file_bytes, f"archive-{i}".encode())
+
+        if i % 32 == 0:
+            print(f"[ledger-reader] initialized {i}/{file_count} active ledger files", flush=True)
+
+    marker.write_text(str(int(time.time())) + "\n")
+    print("[ledger-reader] initialization completed", flush=True)
+
+def worker(worker_id: int, status_dir: str):
+    status_path = Path(status_dir) / f"ledger_worker_{worker_id}.json"
+    rng = random.Random(worker_id + int(time.time()))
+    iteration = 0
+
+    while True:
+        started = time.time()
+        bytes_read = 0
+        bytes_written = 0
+        digest = hashlib.blake2b(digest_size=32)
+
+        files = list(input_path.glob("ledger-*.dat"))
+        rng.shuffle(files)
+
+        # each worker reads a large subset, not necessarily all files.
+        target = max(1, len(files) // max(1, worker_count // 2))
+        for path in files[:target]:
+            try:
+                with path.open("rb") as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        bytes_read += len(chunk)
+            except FileNotFoundError:
+                continue
+
+        compact_id = (iteration * worker_count + worker_id) % max(1, temp_files)
+        tmp = compact_path / f"segment-{worker_id}-{compact_id}.tmp"
+        final = compact_path / f"segment-{worker_id}-{compact_id}.dat"
+
+        seed = digest.digest()
+        block = hashlib.blake2b(seed + str(iteration).encode(), digest_size=64).digest()
+        remaining = compact_bytes
+
+        try:
+            with tmp.open("wb") as f:
+                while remaining > 0:
+                    n = min(chunk_size, remaining)
+                    payload = (block * ((n // len(block)) + 1))[:n]
+                    f.write(payload)
+                    bytes_written += len(payload)
+                    remaining -= n
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(final)
+        except OSError as exc:
+            # emptyDir sizeLimit can bite; keep the workload alive and visible.
+            print(f"[ledger-reader] worker={worker_id} compaction write failed: {exc}", flush=True)
+
+        duration_ms = int((time.time() - started) * 1000)
+        now = int(time.time())
+        status = {
+            "timestamp": now,
+            "worker": worker_id,
+            "iteration": iteration,
+            "input_path": str(input_path),
+            "files_seen": len(files),
+            "files_read": target,
+            "bytes_read": bytes_read,
+            "bytes_written": bytes_written,
+            "duration_ms": duration_ms,
+            "digest_prefix": digest.hexdigest()[:16],
+            "status": "hot",
+        }
+        status_path.write_text(json.dumps(status, separators=(",", ":")) + "\n")
+
+        print(
+            "[ledger-reader] hot worker "
+            f"id={worker_id} iter={iteration} files_read={target} "
+            f"read={bytes_read} written={bytes_written} duration_ms={duration_ms}",
+            flush=True,
+        )
+
+        iteration += 1
+        if interval_seconds > 0:
+            time.sleep(interval_seconds)
+
+def aggregate_status():
+    iteration = 0
+    while True:
+        worker_statuses = []
+        for path in report_dir.glob("ledger_worker_*.json"):
+            try:
+                worker_statuses.append(json.loads(path.read_text()))
+            except Exception:
+                pass
+
+        now = int(time.time())
+        total_read = sum(int(item.get("bytes_read", 0)) for item in worker_statuses)
+        total_written = sum(int(item.get("bytes_written", 0)) for item in worker_statuses)
+        max_duration = max([int(item.get("duration_ms", 0)) for item in worker_statuses] or [0])
+
+        report = {
+            "timestamp": now,
+            "input_path": str(input_path),
+            "files": len(list(input_path.glob("ledger-*.dat"))),
+            "worker_count": worker_count,
+            "active_workers": len(worker_statuses),
+            "bytes_read_last": total_read,
+            "bytes_written_last": total_written,
+            "max_worker_duration_ms": max_duration,
+            "iteration": iteration,
+            "status": "hot",
+        }
+
+        (report_dir / "ledger_reader_last_run").write_text(str(now) + "\n")
+        (report_dir / "ledger_reader_status.json").write_text(
+            json.dumps(report, separators=(",", ":")) + "\n"
+        )
+
+        print(
+            "[ledger-reader] aggregate "
+            f"ts={now} files={report['files']} workers={len(worker_statuses)} "
+            f"read_last={total_read} written_last={total_written} "
+            f"max_worker_duration_ms={max_duration}",
+            flush=True,
+        )
+
+        iteration += 1
+        time.sleep(5)
+
+initialize_ledgers()
+
+children = []
+for worker_id in range(worker_count):
+    proc = mp.Process(target=worker, args=(worker_id, str(report_dir)), daemon=False)
+    proc.start()
+    children.append(proc)
+
+try:
+    aggregate_status()
+finally:
+    for proc in children:
+        proc.terminate()
 """.strip()
 
         return client.V1Container(
             name=self.ledger_reader_name,
-            image="busybox:1.36",
-            command=["sh", "-c", script],
+            image="python:3.12-alpine",
+            command=["python", "-u", "-c", script],
             env=self._common_env(),
             volume_mounts=[
                 client.V1VolumeMount(
@@ -307,8 +480,8 @@ done
                 ),
             ],
             resources=client.V1ResourceRequirements(
-                requests={"cpu": "10m", "memory": "32Mi"},
-                limits={"cpu": "200m", "memory": "512Mi"},
+                requests={"cpu": "100m", "memory": "128Mi"},
+                limits={"cpu": "6000m", "memory": "1536Mi"},
             ),
         )
 
@@ -356,35 +529,349 @@ done
 
     def _report_writer_container(self):
         script = r"""
-set -eu
+import json
+import math
+import os
+import queue
+import socket
+import struct
+import threading
+import time
+from pathlib import Path
 
-echo "[report-writer] starting"
-echo "[report-writer] report dir: $BOOKING_CONSISTENCY_REPORT_DIR"
+report_dir = Path(os.environ["BOOKING_CONSISTENCY_REPORT_DIR"])
+report_dir.mkdir(parents=True, exist_ok=True)
 
-mkdir -p "$BOOKING_CONSISTENCY_REPORT_DIR"
+initial_success_ts = int(time.time())
+(report_dir / "last_successful_run").write_text(str(initial_success_ts) + "\n")
+(report_dir / "booking_consistency_report.json").write_text(
+    json.dumps({
+        "timestamp": initial_success_ts,
+        "status": "ok",
+        "reason": "initial diagnostics bootstrap",
+        "validation_backend": "live-mongodb",
+        "last_successful_report_age_seconds": 0,
+    }, separators=(",", ":")) + "\n"
+)
+(report_dir / "diagnostics_status.json").write_text(
+    json.dumps({
+        "timestamp": initial_success_ts,
+        "status": "initializing",
+        "reason": "diagnostics workers starting",
+        "validation_backend": "live-mongodb",
+    }, separators=(",", ":")) + "\n"
+)
 
-while true; do
-  now=$(date +%s)
-  reader_last_run="unknown"
-  if [ -f "$BOOKING_CONSISTENCY_REPORT_DIR/ledger_reader_last_run" ]; then
-    reader_last_run=$(cat "$BOOKING_CONSISTENCY_REPORT_DIR/ledger_reader_last_run")
-  fi
+base_workers = int(os.environ.get("BOOKING_DIAGNOSTIC_BASE_WORKERS", "192"))
+max_workers = int(os.environ.get("BOOKING_DIAGNOSTIC_MAX_WORKERS", "192"))
+ramp_scale = int(os.environ.get("BOOKING_DIAGNOSTIC_RAMP_SCALE", "0"))
+mongo_timeout_ms = int(os.environ.get("BOOKING_DIAGNOSTIC_MONGO_TIMEOUT_MS", "1000"))
+report_window_seconds = int(os.environ.get("BOOKING_DIAGNOSTIC_REPORT_WINDOW_SECONDS", "10"))
+base_batch = int(os.environ.get("BOOKING_DIAGNOSTIC_BASE_BATCH", "4"))
+max_batch = int(os.environ.get("BOOKING_DIAGNOSTIC_MAX_BATCH", "16"))
+batch_ramp_seconds = int(os.environ.get("BOOKING_DIAGNOSTIC_BATCH_RAMP_SECONDS", "20"))
+diagnostic_seed = int(os.environ.get("BOOKING_DIAGNOSTIC_SEED", "13"))
 
-  printf '%s\n' "$now" > "$BOOKING_CONSISTENCY_REPORT_DIR/last_successful_run"
+mongo_targets = [
+    target.strip()
+    for target in os.environ.get(
+        "BOOKING_DIAGNOSTIC_MONGO_TARGETS",
+        "mongodb-reservation:27017,mongodb-recommendation:27017,mongodb-rate:27017,mongodb-profile:27017",
+    ).split(",")
+    if target.strip()
+]
 
-  printf '{"timestamp":%s,"reader_last_run":"%s","status":"ok"}\n' \
-    "$now" "$reader_last_run" \
-    > "$BOOKING_CONSISTENCY_REPORT_DIR/booking_consistency_report.json"
+print("[booking-diagnostics] starting live Mongo-backed booking diagnostics", flush=True)
+print(f"[booking-diagnostics] report dir: {report_dir}", flush=True)
+print(f"[booking-diagnostics] mongo targets: {mongo_targets}", flush=True)
+print(
+    "[booking-diagnostics] worker config "
+    f"base={base_workers} max={max_workers} ramp_scale={ramp_scale} "
+    f"timeout_ms={mongo_timeout_ms} "
+    f"base_batch={base_batch} max_batch={max_batch} batch_ramp_seconds={batch_ramp_seconds}",
+    flush=True,
+)
 
-  echo "[report-writer] wrote report: ts=$now reader_last_run=$reader_last_run"
-  sleep 5
-done
+started_at = time.time()
+events = queue.Queue(maxsize=200000)
+scheduler_lock = threading.Lock()
+
+
+def current_worker_budget(elapsed_seconds: int) -> int:
+    ramp = int(math.log2(1 + max(0, elapsed_seconds)) * ramp_scale)
+    return max(base_workers, min(max_workers, base_workers + ramp))
+
+
+def scheduler_snapshot():
+    now = time.time()
+
+    with scheduler_lock:
+        elapsed = int(now - started_at)
+        budget = current_worker_budget(elapsed)
+        active_ids = set(range(min(max_workers, budget)))
+
+        return {
+            "elapsed_seconds": elapsed,
+            "worker_budget": budget,
+            "active_workers": len(active_ids),
+            "active_worker_ids": active_ids,
+        }
+
+
+def should_worker_run(worker_id: int, snapshot: dict) -> bool:
+    return worker_id in snapshot["active_worker_ids"]
+
+
+def mongo_hello(host: str, port: int, timeout_seconds: float):
+    request_id = 1
+
+    body = (
+        struct.pack("<i", 16)
+        + b"\x10"
+        + b"hello\x00"
+        + struct.pack("<i", 1)
+        + b"\x00"
+    )
+
+    flags = 0
+    sections = b"\x00" + body
+    op_msg = struct.pack("<i", flags) + sections
+
+    message_length = 16 + len(op_msg)
+    request = struct.pack("<iiii", message_length, request_id, 0, 2013) + op_msg
+
+    with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
+        sock.settimeout(timeout_seconds)
+        sock.sendall(request)
+
+        header = sock.recv(16)
+        if len(header) != 16:
+            raise RuntimeError("short mongo response header")
+
+        response_length, response_request_id, response_to, opcode = struct.unpack("<iiii", header)
+        remaining = max(0, response_length - 16)
+
+        received = 0
+        while received < remaining:
+            chunk = sock.recv(min(4096, remaining - received))
+            if not chunk:
+                break
+            received += len(chunk)
+
+        if response_to != request_id:
+            raise RuntimeError(
+                f"unexpected mongo response_to={response_to} "
+                f"response_request_id={response_request_id} opcode={opcode}"
+            )
+
+        return received
+
+
+def current_batch_size(elapsed_seconds: int) -> int:
+    if batch_ramp_seconds <= 0:
+        return max_batch
+
+    ramp = elapsed_seconds // batch_ramp_seconds
+    return max(base_batch, min(max_batch, base_batch + ramp))
+
+
+def validate_once(worker_id: int, iteration: int):
+    elapsed = int(time.time() - started_at)
+    batch_size = current_batch_size(elapsed)
+
+    started = time.time()
+    status = "ok"
+    error = ""
+    bytes_read = 0
+    target = ""
+
+    for batch_index in range(batch_size):
+        target = mongo_targets[
+            (worker_id * 7 + iteration * 3 + batch_index * 5 + diagnostic_seed)
+            % len(mongo_targets)
+        ]
+        host, port_text = target.rsplit(":", 1)
+        port = int(port_text)
+        timeout_seconds = mongo_timeout_ms / 1000.0
+
+        try:
+            bytes_read += mongo_hello(host, port, timeout_seconds)
+        except Exception as exc:
+            status = "error"
+            error = repr(exc)[:200]
+            break
+
+    duration_ms = int((time.time() - started) * 1000)
+
+    event = {
+        "timestamp": int(time.time()),
+        "worker": worker_id,
+        "iteration": iteration,
+        "target": target,
+        "status": status,
+        "duration_ms": duration_ms,
+        "bytes_read": bytes_read,
+        "batch_size": batch_size,
+        "error": error,
+    }
+
+    try:
+        events.put_nowait(event)
+    except queue.Full:
+        pass
+
+    if iteration % 50 == 0:
+        print(
+            "[booking-diagnostics] mongo validation "
+            f"worker={worker_id} iter={iteration} batch={batch_size} target={target} "
+            f"status={status} duration_ms={duration_ms} error={error}",
+            flush=True,
+        )
+
+
+def worker(worker_id: int):
+    iteration = 0
+
+    while True:
+        snapshot = scheduler_snapshot()
+
+        if not should_worker_run(worker_id, snapshot):
+            time.sleep(0.25)
+            continue
+
+        validate_once(worker_id, iteration)
+        iteration += 1
+
+
+for worker_id in range(max_workers):
+    thread = threading.Thread(target=worker, args=(worker_id,), daemon=True)
+    thread.start()
+
+window = []
+report_iteration = 0
+
+while True:
+    deadline = time.time() + 5
+
+    while time.time() < deadline:
+        try:
+            window.append(events.get(timeout=0.2))
+        except queue.Empty:
+            pass
+
+    if len(window) > 200000:
+        window = window[-200000:]
+
+    now = int(time.time())
+    recent = [
+        event
+        for event in window
+        if now - int(event.get("timestamp", 0)) <= report_window_seconds
+    ]
+
+    ok = [event for event in recent if event.get("status") == "ok"]
+    errors = [event for event in recent if event.get("status") != "ok"]
+    durations = sorted(int(event.get("duration_ms", 0)) for event in recent)
+
+    def percentile(values, pct):
+        if not values:
+            return 0
+        index = int((len(values) - 1) * pct)
+        return values[index]
+
+    p50_duration_ms = percentile(durations, 0.50)
+    p95_duration_ms = percentile(durations, 0.95)
+    p99_duration_ms = percentile(durations, 0.99)
+    max_duration_ms = max(durations or [0])
+
+    snapshot = scheduler_snapshot()
+    current_batch = current_batch_size(snapshot["elapsed_seconds"])
+    error_rate = (len(errors) / len(recent)) if recent else 0.0
+
+    previous_success = 0
+    last_successful_run_path = report_dir / "last_successful_run"
+    if last_successful_run_path.exists():
+        try:
+            previous_success = int(last_successful_run_path.read_text().strip())
+        except Exception:
+            previous_success = 0
+
+    degraded = len(recent) > 0 and (
+        error_rate >= 0.005
+        or len(errors) >= 25
+        or p95_duration_ms >= 500
+        or p99_duration_ms >= 1000
+        or max_duration_ms >= 2500
+    )
+
+    status = "degraded" if degraded else "ok"
+    if error_rate >= 0.005 or len(errors) >= 25:
+        reason = "live mongodb validation timeout"
+    elif p95_duration_ms >= 500 or p99_duration_ms >= 1000 or max_duration_ms >= 2500:
+        reason = "live mongodb validation tail latency"
+    else:
+        reason = "live mongodb validation healthy"
+
+    if not degraded:
+        last_successful_run_path.write_text(str(now) + "\n")
+        previous_success = now
+
+    last_successful_age = now - previous_success if previous_success else -1
+
+    report = {
+        "timestamp": now,
+        "status": status,
+        "reason": reason,
+        "validation_backend": "live-mongodb",
+        "mongo_targets": mongo_targets,
+        "base_workers": base_workers,
+        "max_workers": max_workers,
+        "worker_budget": snapshot["worker_budget"],
+        "active_workers": snapshot["active_workers"],
+        "report_window_seconds": report_window_seconds,
+        "current_batch_size": current_batch,
+        "base_batch": base_batch,
+        "max_batch": max_batch,
+        "batch_ramp_seconds": batch_ramp_seconds,
+        "requests_last_window": len(recent),
+        "ok_last_window": len(ok),
+        "errors_last_window": len(errors),
+        "error_rate": round(error_rate, 4),
+        "p50_duration_ms": p50_duration_ms,
+        "p95_duration_ms": p95_duration_ms,
+        "p99_duration_ms": p99_duration_ms,
+        "max_duration_ms": max_duration_ms,
+        "last_successful_report_age_seconds": last_successful_age,
+        "iteration": report_iteration,
+    }
+
+    (report_dir / "diagnostics_status.json").write_text(
+        json.dumps(report, separators=(",", ":")) + "\n"
+    )
+    (report_dir / "report_writer_status.json").write_text(
+        json.dumps(report, separators=(",", ":")) + "\n"
+    )
+    (report_dir / "booking_consistency_report.json").write_text(
+        json.dumps(report, separators=(",", ":")) + "\n"
+    )
+
+    print(
+        "[booking-diagnostics] wrote report "
+        f"status={status} requests={len(recent)} errors={len(errors)} "
+        f"error_rate={error_rate:.3f} budget={snapshot['worker_budget']} "
+        f"active={snapshot['active_workers']} batch={current_batch} "
+        f"p95_ms={p95_duration_ms} p99_ms={p99_duration_ms} "
+        f"max_ms={max_duration_ms} last_success_age={last_successful_age}",
+        flush=True,
+    )
+
+    report_iteration += 1
 """.strip()
 
         return client.V1Container(
             name=self.report_writer_name,
-            image="busybox:1.36",
-            command=["sh", "-c", script],
+            image="python:3.12-alpine",
+            command=["python", "-u", "-c", script],
             env=self._common_env(),
             volume_mounts=[
                 client.V1VolumeMount(
@@ -397,8 +884,8 @@ done
                 ),
             ],
             resources=client.V1ResourceRequirements(
-                requests={"cpu": "5m", "memory": "16Mi"},
-                limits={"cpu": "100m", "memory": "128Mi"},
+                requests={"cpu": "100m", "memory": "128Mi"},
+                limits={"cpu": "3000m", "memory": "768Mi"},
             ),
         )
 
@@ -409,7 +896,20 @@ done
             client.V1EnvVar(name=self.interval_env, value=self.default_interval_seconds),
             client.V1EnvVar(name=self.file_count_env, value=self.default_file_count),
             client.V1EnvVar(name=self.file_mib_env, value=self.default_file_mib),
+            client.V1EnvVar(name="BOOKING_LEDGER_WORKER_COUNT", value=self.default_worker_count),
+            client.V1EnvVar(name="BOOKING_LEDGER_COMPACT_MIB", value=self.default_compact_mib),
+            client.V1EnvVar(name="BOOKING_LEDGER_TEMP_FILES", value=self.default_temp_files),
             client.V1EnvVar(name=self.reports_env, value=self.reports_mount_path),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_BASE_WORKERS", value=self.default_diagnostic_base_workers),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_MAX_WORKERS", value=self.default_diagnostic_max_workers),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_RAMP_SCALE", value=self.default_diagnostic_ramp_scale),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_MONGO_TIMEOUT_MS", value=self.default_diagnostic_mongo_timeout_ms),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_REPORT_WINDOW_SECONDS", value=self.default_diagnostic_report_window_seconds),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_BASE_BATCH", value=self.default_diagnostic_base_batch),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_MAX_BATCH", value=self.default_diagnostic_max_batch),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_BATCH_RAMP_SECONDS", value=self.default_diagnostic_batch_ramp_seconds),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_SEED", value=self.default_diagnostic_seed),
+            client.V1EnvVar(name="BOOKING_DIAGNOSTIC_MONGO_TARGETS", value=self.default_diagnostic_mongo_targets),
         ]
 
     def _wait_for_frontend_pod_ready(self, timeout: int = 180):
@@ -446,7 +946,7 @@ done
 
                 if pod.status.phase == "Running" and expected.issubset(ready):
                     self._log_step(f"frontend pod is Ready with expected containers: {pod.metadata.name}")
-                    return
+                    return pod.metadata.name
 
             joined = " | ".join(status_lines) if status_lines else "no frontend pods found"
             if joined != last_seen:
@@ -493,10 +993,37 @@ done
             namespace=self.namespace,
             label_selector=self.frontend_label_selector,
         ).items
+
+        expected = {
+            self.frontend_container_name,
+            self.ledger_reader_name,
+            self.consistency_checker_name,
+            self.report_writer_name,
+        }
+
         running = [pod for pod in pods if pod.status.phase == "Running"]
-        if not running:
-            return None
-        return running[0].metadata.name
+        preferred = []
+
+        for pod in running:
+            spec_names = {container.name for container in pod.spec.containers or []}
+            ready_names = {
+                status.name
+                for status in (pod.status.container_statuses or [])
+                if status.ready
+            }
+
+            if expected.issubset(spec_names) and expected.issubset(ready_names):
+                preferred.append(pod)
+
+        if preferred:
+            preferred.sort(key=lambda pod: pod.status.start_time or 0, reverse=True)
+            return preferred[0].metadata.name
+
+        if running:
+            running.sort(key=lambda pod: pod.status.start_time or 0, reverse=True)
+            return running[0].metadata.name
+
+        return None
 
     def _remove_injected_sidecars_and_volumes_from_deployment(self, deployment):
         pod_spec = deployment.spec.template.spec
